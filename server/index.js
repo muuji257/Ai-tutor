@@ -14,74 +14,132 @@ app.use(
 
 app.use(express.json({ limit: "3mb" }));
 
-// GEMINI CONFIGURATION
+// =====================================
+// PROVIDER CONFIGURATION
+// =====================================
+
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
 const GEMINI_MODEL =
   process.env.GEMINI_MODEL || "gemini-3.8-flash";
 
-// OPTIONAL OPENAI VOICE
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
+
+// Groq is opt-in. Enable only after checking
+// the account's free-tier and billing settings.
+const GROQ_ENABLED =
+  process.env.ENABLE_GROQ === "true";
+
+const GROQ_MODEL =
+  process.env.GROQ_MODEL || "openai/gpt-oss-20b";
+
+// Optional OpenAI voice service.
+// This is separate from the three text providers.
 const speechClient = process.env.OPENAI_API_KEY
   ? new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY
+      apiKey: process.env.OPENAI_API_KEY,
+      timeout: 30000,
+      maxRetries: 0
+    })
+  : null;
+
+// OpenRouter client
+const openRouterClient = OPENROUTER_API_KEY
+  ? new OpenAI({
+      apiKey: OPENROUTER_API_KEY,
+      baseURL: "https://openrouter.ai/api/v1",
+      timeout: 25000,
+      maxRetries: 0
+    })
+  : null;
+
+// Groq client
+const groqClient = GROQ_API_KEY && GROQ_ENABLED
+  ? new OpenAI({
+      apiKey: GROQ_API_KEY,
+      baseURL: "https://api.groq.com/openai/v1",
+      timeout: 25000,
+      maxRetries: 0
     })
   : null;
 
 
-// COMMON GEMINI FUNCTION WITH AUTOMATIC RETRIES
-async function askGemini(prompt, maxOutputTokens = 8192) {
-  if (!GEMINI_API_KEY) {
-    throw new Error("Gemini API key is missing.");
+// =====================================
+// JSON RESPONSE PARSER
+// =====================================
+
+function parseAIJson(raw) {
+  if (!raw || typeof raw !== "string") {
+    throw new Error("AI returned an empty response.");
   }
 
-  const maxAttempts = 3;
+  let cleaned = raw.trim();
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    let response;
+  // Remove Markdown code fences if present.
+  cleaned = cleaned
+    .replace(/^```(?:json)?\s*/i, "")
+    .replace(/\s*```$/, "")
+    .trim();
 
-    try {
-      response = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-        {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "x-goog-api-key": GEMINI_API_KEY
-          },
-          body: JSON.stringify({
-            contents: [
-              {
-                role: "user",
-                parts: [{ text: prompt }]
-              }
-            ],
-            generationConfig: {
-              responseMimeType: "application/json",
-              maxOutputTokens,
-              temperature: 0.5
-            }
-          })
-        }
-      );
-    } catch (error) {
-      if (attempt === maxAttempts) {
-        throw new Error(
-          "Could not connect to Gemini. Please try again."
-        );
-      }
+  try {
+    return JSON.parse(cleaned);
+  } catch {
+    // Try extracting the main JSON object.
+    const first = cleaned.indexOf("{");
+    const last = cleaned.lastIndexOf("}");
 
-      const waitTime = attempt * 2000;
-
-      console.log(
-        `Gemini connection failed. Retrying in ${waitTime}ms.`
-      );
-
-      await new Promise(resolve =>
-        setTimeout(resolve, waitTime)
-      );
-
-      continue;
+    if (first !== -1 && last > first) {
+      return JSON.parse(cleaned.slice(first, last + 1));
     }
+
+    throw new Error("AI returned invalid JSON.");
+  }
+}
+
+
+// =====================================
+// GEMINI PROVIDER
+// =====================================
+
+async function askGemini(prompt, maxOutputTokens) {
+  if (!GEMINI_API_KEY) {
+    throw new Error("Gemini API key missing.");
+  }
+
+  const controller = new AbortController();
+
+  const timeout = setTimeout(
+    () => controller.abort(),
+    25000
+  );
+
+  try {
+    const response = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+      {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          "Content-Type": "application/json",
+          "x-goog-api-key": GEMINI_API_KEY
+        },
+        body: JSON.stringify({
+          contents: [
+            {
+              role: "user",
+              parts: [{ text: prompt }]
+            }
+          ],
+          generationConfig: {
+            responseMimeType: "application/json",
+            maxOutputTokens,
+            temperature: 0.5
+          }
+        })
+      }
+    );
 
     const responseText = await response.text();
 
@@ -94,78 +152,168 @@ async function askGemini(prompt, maxOutputTokens = 8192) {
     }
 
     if (!response.ok) {
-      const retryable = [429, 500, 502, 503, 504].includes(
-        response.status
+      throw new Error(
+        data.error?.message ||
+        `Gemini request failed (${response.status}).`
       );
-
-      if (!retryable || attempt === maxAttempts) {
-        throw new Error(
-          data.error?.message ||
-          `Gemini request failed (${response.status}).`
-        );
-      }
-
-      const retryAfter = Number(
-        response.headers.get("Retry-After")
-      );
-
-      const waitTime =
-        Number.isFinite(retryAfter) && retryAfter > 0
-          ? Math.min(retryAfter * 1000, 10000)
-          : attempt * 2000;
-
-      console.log(
-        `Gemini returned ${response.status}. Attempt ${attempt + 1}/${maxAttempts} in ${waitTime}ms.`
-      );
-
-      await new Promise(resolve =>
-        setTimeout(resolve, waitTime)
-      );
-
-      continue;
     }
 
     const raw = data.candidates?.[0]?.content?.parts
       ?.map(part => part.text || "")
       .join("");
 
-    if (!raw) {
-      throw new Error("Gemini returned an empty response.");
-    }
+    return parseAIJson(raw);
 
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+
+// =====================================
+// OPENAI-COMPATIBLE PROVIDERS
+// =====================================
+
+async function askCompatibleProvider(
+  client,
+  model,
+  prompt,
+  maxOutputTokens
+) {
+  const completion =
+    await client.chat.completions.create({
+      model,
+      messages: [
+        {
+          role: "user",
+          content: prompt
+        }
+      ],
+      response_format: {
+        type: "json_object"
+      },
+      max_tokens: maxOutputTokens,
+      temperature: 0.5
+    });
+
+  const raw = completion.choices?.[0]?.message?.content;
+
+  return parseAIJson(raw);
+}
+
+
+// =====================================
+// AUTOMATIC AI FALLBACK ROUTER
+// =====================================
+
+async function askAI(prompt, maxOutputTokens = 4096) {
+  const providers = [];
+
+  if (GEMINI_API_KEY) {
+    providers.push({
+      name: "Gemini",
+      run: () => askGemini(prompt, maxOutputTokens)
+    });
+  }
+
+  if (openRouterClient) {
+    providers.push({
+      name: "OpenRouter",
+      run: () =>
+        askCompatibleProvider(
+          openRouterClient,
+          "openrouter/free",
+          prompt,
+          maxOutputTokens
+        )
+    });
+  }
+
+  if (groqClient) {
+    providers.push({
+      name: "Groq",
+      run: () =>
+        askCompatibleProvider(
+          groqClient,
+          GROQ_MODEL,
+          prompt,
+          maxOutputTokens
+        )
+    });
+  }
+
+  if (providers.length === 0) {
+    throw new Error("No AI provider is configured.");
+  }
+
+  const errors = [];
+
+  for (const provider of providers) {
     try {
-      return JSON.parse(raw);
-    } catch {
-      throw new Error("Gemini returned invalid JSON.");
+      console.log(`Trying AI provider: ${provider.name}`);
+
+      const result = await provider.run();
+
+      console.log(`AI response received from ${provider.name}`);
+
+      return {
+        result,
+        provider: provider.name
+      };
+
+    } catch (error) {
+      const message = error?.message || "Unknown error";
+
+      console.error(
+        `${provider.name} failed: ${message}`
+      );
+
+      errors.push(`${provider.name}: ${message}`);
     }
   }
 
+  console.error("All AI providers failed:", errors);
+
   throw new Error(
-    "Gemini is temporarily unavailable. Please try again."
+    "All configured AI providers are currently unavailable. Please try again shortly."
   );
 }
 
 
+// =====================================
 // HEALTH CHECK
+// =====================================
+
 app.get("/api/health", (_req, res) => {
+  const providers = {
+    gemini: Boolean(GEMINI_API_KEY),
+    openrouter: Boolean(openRouterClient),
+    groq: Boolean(groqClient),
+    groqKeyPresent: Boolean(GROQ_API_KEY),
+    openaiVoice: Boolean(speechClient)
+  };
+
+  const configured =
+    providers.gemini ||
+    providers.openrouter ||
+    providers.groq;
+
   res.json({
     ok: true,
-    configured: Boolean(GEMINI_API_KEY),
-    provider: GEMINI_API_KEY ? "Google Gemini" : null,
-    model: GEMINI_API_KEY ? GEMINI_MODEL : null
+    configured,
+    provider: "Gemini → OpenRouter → Groq",
+    model: GEMINI_MODEL,
+    providers
   });
 });
 
 
+// =====================================
 // AI TUTOR
+// =====================================
+
 app.post("/api/tutor", async (req, res) => {
   try {
-    if (!GEMINI_API_KEY) {
-      return res.status(503).json({
-        error: "Gemini API key is not configured."
-      });
-    }
-
     const {
       messages,
       language = "auto"
@@ -184,7 +332,9 @@ app.post("/api/tutor", async (req, res) => {
           message.role === "assistant"
             ? "TUTOR"
             : "STUDENT",
-        content: String(message.content ?? "").slice(0, 5000)
+        content: String(
+          message.content ?? ""
+        ).slice(0, 5000)
       }));
 
     const languageNote =
@@ -244,7 +394,10 @@ ${safeMessages
   .join("\n\n")}
 `;
 
-    const result = await askGemini(prompt, 4096);
+    const { result, provider } = await askAI(
+      prompt,
+      4096
+    );
 
     res.json({
       reply: String(
@@ -253,28 +406,28 @@ ${safeMessages
       board: Array.isArray(result.board)
         ? result.board.slice(0, 10)
         : [],
-      checkQuestion: String(result.checkQuestion || "")
+      checkQuestion: String(
+        result.checkQuestion || ""
+      ),
+      provider
     });
 
   } catch (error) {
     console.error("Tutor error:", error.message);
 
-    res.status(500).json({
-      error: error.message || "The tutor couldn't answer."
+    res.status(503).json({
+      error: error.message
     });
   }
 });
 
 
+// =====================================
 // GENERATE LESSON FROM PDF
+// =====================================
+
 app.post("/api/lesson", async (req, res) => {
   try {
-    if (!GEMINI_API_KEY) {
-      return res.status(503).json({
-        error: "Gemini API key is not configured."
-      });
-    }
-
     const {
       text,
       name = "Uploaded PDF",
@@ -371,11 +524,15 @@ PDF TEXT:
 ${sourceText}
 `;
 
-    const lesson = await askGemini(prompt, 8192);
+    const { result: lesson, provider } = await askAI(
+      prompt,
+      8192
+    );
 
     res.json({
       success: true,
       lesson,
+      provider,
       truncated: wasTruncated,
       message: wasTruncated
         ? "Only the first 180,000 characters were sent. More document processing will be needed for complete coverage."
@@ -383,16 +540,22 @@ ${sourceText}
     });
 
   } catch (error) {
-    console.error("Lesson generation error:", error.message);
+    console.error(
+      "Lesson generation error:",
+      error.message
+    );
 
-    res.status(500).json({
-      error: error.message || "Could not generate the lesson."
+    res.status(503).json({
+      error: error.message
     });
   }
 });
 
 
-// EXISTING AI VOICE
+// =====================================
+// EXISTING OPENAI VOICE
+// =====================================
+
 app.post("/api/speech", async (req, res) => {
   try {
     if (!speechClient) {
@@ -465,10 +628,13 @@ app.post("/api/speech", async (req, res) => {
 });
 
 
+// =====================================
 // START SERVER
+// =====================================
+
 const PORT = Number(process.env.PORT || 8787);
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Aha Tutor API running on port ${PORT}`);
 });
-       
+                                      
