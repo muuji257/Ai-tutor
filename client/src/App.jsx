@@ -1,4 +1,5 @@
 import React, { useEffect, useRef, useState } from "react";
+import PdfUpload from "./PdfUpload.jsx";
 import { AudioLines, BookOpen, Brain, ChevronDown, CircleHelp, Eraser, Languages, Mic, MicOff, Pause, Play, Plus, Send, Sparkles, Square, Volume2, X } from "lucide-react";
 
 const API = import.meta.env.VITE_API_URL || "http://localhost:8787";
@@ -12,6 +13,7 @@ export default function App() {
   const [messages, setMessages] = useState([starter]);
   const [board, setBoard] = useState(starter.board);
   const [draft, setDraft] = useState("");
+  const [pdfData, setPdfData] = useState(null);
   const [busy, setBusy] = useState(false);
   const [language, setLanguage] = useState("auto");
   const [voice, setVoice] = useState("nova");
