@@ -172,7 +172,8 @@ export default function App() {
             <div><div className="eyebrow"><span className="eyebrow-line"></span> YOUR PERSONAL AI TUTOR</div><h1>Let's make it <em>click.</em></h1><p className="subhead">Ask anything. Work it through. See every step.</p></div>
             <div className="brain-orb"><div className="orb-core"><Brain size={26}/></div><span className="orb-ring ring-one"></span><span className="orb-ring ring-two"></span></div>
           </div>
-
+<PdfUpload onTextExtracted={setPdfData} />
+          
           <div className="board-card">
             <div className="board-header">
               <div className="board-title"><div className="board-icon"><BookOpen size={16}/></div><div><strong>Learning board</strong><small>LIVE EXPLANATION</small></div></div>
