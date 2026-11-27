@@ -20,65 +20,131 @@ const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const GEMINI_MODEL =
   process.env.GEMINI_MODEL || "gemini-3.8-flash";
 
-// Keep OpenAI optional for the existing speech feature.
+// OPTIONAL OPENAI VOICE
 const speechClient = process.env.OPENAI_API_KEY
   ? new OpenAI({
       apiKey: process.env.OPENAI_API_KEY
     })
   : null;
 
-// COMMON GEMINI FUNCTION
+
+// COMMON GEMINI FUNCTION WITH AUTOMATIC RETRIES
 async function askGemini(prompt, maxOutputTokens = 8192) {
   if (!GEMINI_API_KEY) {
     throw new Error("Gemini API key is missing.");
   }
 
-  const response = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-    {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": GEMINI_API_KEY
-      },
-      body: JSON.stringify({
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: prompt }]
-          }
-        ],
-        generationConfig: {
-          responseMimeType: "application/json",
-          maxOutputTokens,
-          temperature: 0.5
+  const maxAttempts = 3;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    let response;
+
+    try {
+      response = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": GEMINI_API_KEY
+          },
+          body: JSON.stringify({
+            contents: [
+              {
+                role: "user",
+                parts: [{ text: prompt }]
+              }
+            ],
+            generationConfig: {
+              responseMimeType: "application/json",
+              maxOutputTokens,
+              temperature: 0.5
+            }
+          })
         }
-      })
+      );
+    } catch (error) {
+      if (attempt === maxAttempts) {
+        throw new Error(
+          "Could not connect to Gemini. Please try again."
+        );
+      }
+
+      const waitTime = attempt * 2000;
+
+      console.log(
+        `Gemini connection failed. Retrying in ${waitTime}ms.`
+      );
+
+      await new Promise(resolve =>
+        setTimeout(resolve, waitTime)
+      );
+
+      continue;
     }
+
+    const responseText = await response.text();
+
+    let data;
+
+    try {
+      data = JSON.parse(responseText);
+    } catch {
+      throw new Error("Gemini returned an invalid response.");
+    }
+
+    if (!response.ok) {
+      const retryable = [429, 500, 502, 503, 504].includes(
+        response.status
+      );
+
+      if (!retryable || attempt === maxAttempts) {
+        throw new Error(
+          data.error?.message ||
+          `Gemini request failed (${response.status}).`
+        );
+      }
+
+      const retryAfter = Number(
+        response.headers.get("Retry-After")
+      );
+
+      const waitTime =
+        Number.isFinite(retryAfter) && retryAfter > 0
+          ? Math.min(retryAfter * 1000, 10000)
+          : attempt * 2000;
+
+      console.log(
+        `Gemini returned ${response.status}. Attempt ${attempt + 1}/${maxAttempts} in ${waitTime}ms.`
+      );
+
+      await new Promise(resolve =>
+        setTimeout(resolve, waitTime)
+      );
+
+      continue;
+    }
+
+    const raw = data.candidates?.[0]?.content?.parts
+      ?.map(part => part.text || "")
+      .join("");
+
+    if (!raw) {
+      throw new Error("Gemini returned an empty response.");
+    }
+
+    try {
+      return JSON.parse(raw);
+    } catch {
+      throw new Error("Gemini returned invalid JSON.");
+    }
+  }
+
+  throw new Error(
+    "Gemini is temporarily unavailable. Please try again."
   );
-
-  const data = await response.json();
-
-  if (!response.ok) {
-    throw new Error(
-      data.error?.message || "Gemini request failed."
-    );
-  }
-
-  const raw = data.candidates?.[0]?.content?.parts
-    ?.map(part => part.text || "")
-    .join("");
-
-  if (!raw) {
-    throw new Error("Gemini returned an empty response.");
-  }
-
-  try {
-    return JSON.parse(raw);
-  } catch {
-    throw new Error("Gemini returned invalid JSON.");
-  }
 }
+
 
 // HEALTH CHECK
 app.get("/api/health", (_req, res) => {
@@ -89,6 +155,7 @@ app.get("/api/health", (_req, res) => {
     model: GEMINI_API_KEY ? GEMINI_MODEL : null
   });
 });
+
 
 // AI TUTOR
 app.post("/api/tutor", async (req, res) => {
@@ -198,6 +265,7 @@ ${safeMessages
   }
 });
 
+
 // GENERATE LESSON FROM PDF
 app.post("/api/lesson", async (req, res) => {
   try {
@@ -225,7 +293,6 @@ app.post("/api/lesson", async (req, res) => {
       });
     }
 
-    // Limit request size to protect the free API quota.
     const sourceText = text.slice(0, 180000);
     const wasTruncated = text.length > sourceText.length;
 
@@ -319,11 +386,11 @@ ${sourceText}
     console.error("Lesson generation error:", error.message);
 
     res.status(500).json({
-      error:
-        error.message || "Could not generate the lesson."
+      error: error.message || "Could not generate the lesson."
     });
   }
 });
+
 
 // EXISTING AI VOICE
 app.post("/api/speech", async (req, res) => {
@@ -397,10 +464,11 @@ app.post("/api/speech", async (req, res) => {
   }
 });
 
+
 // START SERVER
 const PORT = Number(process.env.PORT || 8787);
 
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Aha Tutor API running on port ${PORT}`);
 });
-  
+       
